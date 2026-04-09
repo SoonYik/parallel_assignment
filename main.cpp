@@ -17,7 +17,7 @@ void applyEdgeDetection(unsigned char* inputImage, unsigned char* outputEdges, i
 
     cout << "Starting OpenMP Edge Detection with " << omp_get_max_threads() << " threads..." << endl;
 
-    // OpenMP directive to parallelize the outer loop
+    //parallelize the outer loop
     #pragma omp parallel for schedule(dynamic)
     for (int y = 1; y < height - 1; ++y) {
         for (int x = 1; x < width - 1; ++x) {
@@ -26,7 +26,7 @@ void applyEdgeDetection(unsigned char* inputImage, unsigned char* outputEdges, i
 
             for (int i = -1; i <= 1; ++i) {
                 for (int j = -1; j <= 1; ++j) {
-                    // Convert 2D coordinates (x,y) to 1D array index: (y * width) + x
+                    // Convert 2D coordinates to 1D array
                     int pixelIndex = ((y + i) * width) + (x + j);
                     int pixelValue = inputImage[pixelIndex];
 
@@ -38,7 +38,7 @@ void applyEdgeDetection(unsigned char* inputImage, unsigned char* outputEdges, i
             int magnitude = sqrt((sumX * sumX) + (sumY * sumY));
             if (magnitude > 255) magnitude = 255;
 
-            // Store the result in the output array
+            // Store the result
             outputEdges[(y * width) + x] = (unsigned char)magnitude;
         }
     }
