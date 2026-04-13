@@ -10,16 +10,46 @@
 
 using namespace std;
 
-//Sobel Filter using 1D arrays
-void applyEdgeDetection(unsigned char* inputImage, unsigned char* outputEdges, int width, int height) 
+//Gaussian Blur
+void applyGaussianBlur(unsigned char* inputImage, unsigned char* outputImage, int width, int height)
 {
+    cout << "Running Step 1: Gaussian Blur..." << endl;
+
+    int kernel[5][5] = {
+        {1,  4,  7,  4, 1},
+        {4, 16, 26, 16, 4},
+        {7, 26, 41, 26, 7},
+        {4, 16, 26, 16, 4},
+        {1,  4,  7,  4, 1}
+    };
+    int kernelWeight = 273;
+
+#pragma omp parallel for schedule(dynamic)
+    for (int y = 2; y < height - 2; ++y) {
+        for (int x = 2; x < width - 2; ++x) {
+            int sum = 0;
+            for (int i = -2; i <= 2; ++i) {
+                for (int j = -2; j <= 2; ++j) {
+                    // Convert 2D coordinates to the 1D array index
+                    int pixelIndex = ((y + i) * width) + (x + j);
+                    sum += inputImage[pixelIndex] * kernel[i + 2][j + 2];
+                }
+            }
+            outputImage[(y * width) + x] = (unsigned char)(sum / kernelWeight);
+        }
+    }
+}
+
+//Sobel Filter
+void applyEdgeDetection(unsigned char* inputImage, unsigned char* outputEdges, float* outputAngles, int width, int height)
+{
+    cout << "Running Step 2: Edge Detection..." << endl;
+
     int Gx[3][3] = { {-1, 0, 1}, {-2, 0, 2}, {-1, 0, 1} };
     int Gy[3][3] = { {-1, -2, -1}, {0, 0, 0}, {1, 2, 1} };
 
-    cout << "Starting OpenMP Edge Detection with " << omp_get_max_threads() << " threads..." << endl;
-
     //parallelize the outer loop
-    #pragma omp parallel for schedule(dynamic)
+#pragma omp parallel for schedule(dynamic)
     for (int y = 1; y < height - 1; ++y) {
         for (int x = 1; x < width - 1; ++x) {
             int sumX = 0;
@@ -27,7 +57,6 @@ void applyEdgeDetection(unsigned char* inputImage, unsigned char* outputEdges, i
 
             for (int i = -1; i <= 1; ++i) {
                 for (int j = -1; j <= 1; ++j) {
-                    // Convert 2D coordinates to 1D array
                     int pixelIndex = ((y + i) * width) + (x + j);
                     int pixelValue = inputImage[pixelIndex];
 
@@ -37,34 +66,128 @@ void applyEdgeDetection(unsigned char* inputImage, unsigned char* outputEdges, i
             }
 
             int magnitude = sqrt((sumX * sumX) + (sumY * sumY));
+            float angle = atan2(sumY, sumX) * (180.0 / 3.14159265);
+            if (angle < 0) {
+                angle += 180.0;
+            }
+            outputAngles[(y * width) + x] = angle;
             if (magnitude > 255) magnitude = 255;
-
-            // Store the result
             outputEdges[(y * width) + x] = (unsigned char)magnitude;
         }
     }
 }
 
-// This is YOUR territory. Soon Yik doesn't need to touch this.
-void runParallelIntegration(unsigned char* fullImage, int width, int height, int rank, int size) {
+//Non-Maximum Suppression
+void applyNonMaxSuppression(unsigned char* magnitudeImg, float* angleImg, unsigned char* outputImg, int width, int height)
+{
+    cout << "Running Step 3: Non-Maximum Suppression..." << endl;
+#pragma omp parallel for schedule(dynamic)
+    for (int y = 1; y < height - 1; ++y) {
+        for (int x = 1; x < width - 1; ++x) {
+            int idx = (y * width) + x;
+            float angle = angleImg[idx];
+            unsigned char mag = magnitudeImg[idx];
+            unsigned char pixel1 = 255;
+            unsigned char pixel2 = 255;
 
-    // 1. Calculate how to slice the banana
+            if ((angle >= 0 && angle < 22.5) || (angle >= 157.5 && angle <= 180)) {
+                pixel1 = magnitudeImg[y * width + (x + 1)];
+                pixel2 = magnitudeImg[y * width + (x - 1)];
+            }
+            else if (angle >= 22.5 && angle < 67.5) {
+                pixel1 = magnitudeImg[(y + 1) * width + (x - 1)];
+                pixel2 = magnitudeImg[(y - 1) * width + (x + 1)];
+            }
+            else if (angle >= 67.5 && angle < 112.5) {
+                pixel1 = magnitudeImg[(y + 1) * width + x];
+                pixel2 = magnitudeImg[(y - 1) * width + x];
+            }
+            else if (angle >= 112.5 && angle < 157.5) {
+                pixel1 = magnitudeImg[(y - 1) * width + (x - 1)];
+                pixel2 = magnitudeImg[(y + 1) * width + (x + 1)];
+            }
+
+            if (mag >= pixel1 && mag >= pixel2) {
+                outputImg[idx] = mag;
+            }
+            else {
+                outputImg[idx] = 0;
+            }
+        }
+    }
+}
+
+// Finalize edges using High and Low thresholds
+void applyHysteresis(unsigned char* inputImg, unsigned char* outputImg, int width, int height, int lowThresh, int highThresh)
+{
+    cout << "Running Step 4: Hysteresis Thresholding..." << endl;
+
+    unsigned char* tempThresh = new unsigned char[width * height];
+
+#pragma omp parallel for schedule(dynamic)
+    for (int i = 0; i < width * height; ++i) {
+        if (inputImg[i] >= highThresh) {
+            tempThresh[i] = 255;
+            outputImg[i] = 255;
+        }
+        else if (inputImg[i] >= lowThresh) {
+            tempThresh[i] = 50;
+        }
+        else {
+            tempThresh[i] = 0;
+            outputImg[i] = 0;
+        }
+    }
+
+#pragma omp parallel for schedule(dynamic)
+    for (int y = 1; y < height - 1; ++y) {
+        for (int x = 1; x < width - 1; ++x) {
+            int idx = (y * width) + x;
+            if (tempThresh[idx] == 50) {
+                bool touchesStrongEdge = false;
+                for (int i = -1; i <= 1; ++i) {
+                    for (int j = -1; j <= 1; ++j) {
+                        int neighborIdx = ((y + i) * width) + (x + j);
+                        if (tempThresh[neighborIdx] == 255) {
+                            touchesStrongEdge = true;
+                        }
+                    }
+                }
+                if (touchesStrongEdge) {
+                    outputImg[idx] = 255;
+                }
+                else {
+                    outputImg[idx] = 0;
+                }
+            }
+        }
+    }
+
+    delete[] tempThresh; // Clean up memory
+}
+
+void runHybridProcessing(unsigned char* fullImage, int width, int height, int rank, int size) {
+
     int rows_per_rank = height / size;
     int chunk_size = width * rows_per_rank;
 
-    // 2. Every rank (worker) needs a small local bucket to hold their slice
     unsigned char* localInput = new unsigned char[chunk_size];
+    unsigned char* localBlur = new unsigned char[chunk_size];
+    unsigned char* localSobel = new unsigned char[chunk_size];
+    float* localAngles = new float[chunk_size];
+    unsigned char* localNms = new unsigned char[chunk_size];
     unsigned char* localOutput = new unsigned char[chunk_size];
 
-    // 3. SCATTER: Rank 0 cuts the image and sends pieces to everyone else
-    // If rank != 0, fullImage is ignored, and they just wait to receive.
     MPI_Scatter(fullImage, chunk_size, MPI_UNSIGNED_CHAR,
         localInput, chunk_size, MPI_UNSIGNED_CHAR,
         0, MPI_COMM_WORLD);
 
     // 4. THE HAND-OFF: Call Soon Yik's code on the local chunk
     // Notice we pass 'rows_per_rank' as the height!
-    applyEdgeDetection(localInput, localOutput, width, rows_per_rank);
+    applyGaussianBlur(localInput, localBlur, width, rows_per_rank);
+    applyEdgeDetection(localBlur, localSobel, localAngles, width, rows_per_rank);
+    applyNonMaxSuppression(localSobel, localAngles, localNms, width, rows_per_rank);
+    applyHysteresis(localNms, localOutput, width, rows_per_rank, 50, 150);
 
     // 5. GATHER: Rank 0 collects all the finished slices back into fullImage
     MPI_Gather(localOutput, chunk_size, MPI_UNSIGNED_CHAR,
@@ -72,94 +195,86 @@ void runParallelIntegration(unsigned char* fullImage, int width, int height, int
         0, MPI_COMM_WORLD);
 
     // Clean up local memory
-    delete[] localInput;
-    delete[] localOutput;
+    delete[] localInput; delete[] localBlur; delete[] localSobel;
+    delete[] localAngles; delete[] localNms; delete[] localOutput;
 }
 
-int main(int argc, char** argv) 
-{
+int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
     int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
     int width, height, channels;
-    unsigned char* imgData = NULL;
+    unsigned char* rawImg = NULL;
 
-    // Only Rank 0 loads the file
+    // Only Rank 0 loads the image
     if (rank == 0) {
-        imgData = stbi_load("banana.jpg", &width, &height, &channels, 1);
-        if (!imgData) { MPI_Abort(MPI_COMM_WORLD, 1); }
+        rawImg = stbi_load("road.jpg", &width, &height, &channels, 1);
+        if (!rawImg) {
+            cout << "Failed to load image!" << endl;
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
     }
 
-    // Broadcast dimensions so everyone knows the "slice" math
+    // Share dimensions with all ranks
     MPI_Bcast(&width, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(&height, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-    // RUN YOUR WRAPPER
-    runParallelIntegration(imgData, width, height, rank, size);
+    double startTime = omp_get_wtime();
 
-    // Only Rank 0 saves the final combined result
+    // Run your hybrid orchestration
+    runHybridProcessing(rawImg, width, height, rank, size);
+
     if (rank == 0) {
-        stbi_write_jpg("output_edges_parallel.jpg", width, height, 1, imgData, 100);
-        stbi_image_free(imgData);
+        double endTime = omp_get_wtime();
+        cout << "Total Parallel Execution time: " << (endTime - startTime) << " seconds" << endl;
+        stbi_write_jpg("4_final_edges.jpg", width, height, 1, rawImg, 100);
+        stbi_image_free(rawImg);
     }
 
     MPI_Finalize();
-
-    //unsigned char* imgData = stbi_load("banana.jpg", &width, &height, &channels, 1);
-
-    //if (imgData == NULL) {
-    //    cout << "Error loading banana.jpg." << endl;
-    //    return 1;
-    //}
-    //cout << "Loaded image: " << width << "x" << height << " pixels." << endl;
-
-    //size_t imgSize = width * height;
-    //unsigned char* outputData = new unsigned char[imgSize];
-    //
-    //// Initialize output array to pure black (0)
-    //for (size_t i = 0; i < imgSize; ++i) {
-    //    outputData[i] = 0;
-    //}
-
-    //omp_set_num_threads(4);
-    //double startTime = omp_get_wtime();
-    //applyEdgeDetection(imgData, outputData, width, height);
-    //double endTime = omp_get_wtime();
-    //cout << "Processing Time: " << (endTime - startTime) << " seconds." << endl;
-
-    ////Save result
-    //int writeSuccess = stbi_write_jpg("output_edges.jpg", width, height, 1, outputData, 100);
-
-    //if (writeSuccess) {
-    //    cout << "Successfully saved edge detection result to 'output_edges.jpg'." << endl;
-    //}
-    //else {
-    //    cout << "Failed to write the output image." << endl;
-    //}
-
-    ////Clean up memory
-    //stbi_image_free(imgData);
-    //delete[] outputData;
-
     return 0;
 }
 
-//#include <mpi.h>
-//#include <iostream>
+//int main() {
+//    int width, height, channels;
+//    unsigned char* rawImg = stbi_load("road.jpg", &width, &height, &channels, 1);
+//    size_t imgSize = width * height;
+//    unsigned char* blurredImg = new unsigned char[imgSize];
+//    float* angleImg = new float[imgSize];
+//    unsigned char* sobelImg = new unsigned char[imgSize];
+//    unsigned char* nmsImg = new unsigned char[imgSize];
+//    unsigned char* finalImg = new unsigned char[imgSize];
 //
-//int main(int argc, char** argv) {
-//    MPI_Init(&argc, &argv);
+//    double startTime = omp_get_wtime();
 //
-//    int world_size;
-//    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+//    //1: Gaussian Blur
+//    applyGaussianBlur(rawImg, blurredImg, width, height);
+//    stbi_write_jpg("1_blurred.jpg", width, height, 1, blurredImg, 100);
 //
-//    int world_rank;
-//    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+//    //2: Sobel Filter
+//    applyEdgeDetection(blurredImg, sobelImg, angleImg, width, height);
+//    stbi_write_jpg("2_sobel_edges.jpg", width, height, 1, sobelImg, 100);
 //
-//    std::cout << "Hello from Rank " << world_rank << " out of " << world_size << " processors!" << std::endl;
+//    //3: Non-Maximum Suppression
+//    applyNonMaxSuppression(sobelImg, angleImg, nmsImg, width, height);
+//    stbi_write_jpg("3_nms_thinned.jpg", width, height, 1, nmsImg, 100);
 //
-//    MPI_Finalize();
+//    //4: Hysteresis Thresholding
+//    applyHysteresis(nmsImg, finalImg, width, height, 50, 150);
+//    stbi_write_jpg("4_final_edges.jpg", width, height, 1, finalImg, 100);
+//
+//    double endTime = omp_get_wtime();
+//    cout << "Total execution time: " << (endTime - startTime) << " seconds" << endl;
+//
+//    // Clean up memory
+//    stbi_image_free(rawImg);
+//    delete[] blurredImg;
+//    delete[] sobelImg;
+//    delete[] nmsImg;
+//    delete[] finalImg;
+//    delete[] angleImg;
+//
 //    return 0;
 //}
