@@ -9,13 +9,43 @@
 
 using namespace std;
 
-//Sobel Filter using 1D arrays
-void applyEdgeDetection(unsigned char* inputImage, unsigned char* outputEdges, int width, int height) 
+//Gaussian Blur
+void applyGaussianBlur(unsigned char* inputImage, unsigned char* outputImage, int width, int height) 
 {
+    cout << "Running Step 1: Gaussian Blur..." << endl;
+
+    int kernel[5][5] = {
+        {1,  4,  7,  4, 1},
+        {4, 16, 26, 16, 4},
+        {7, 26, 41, 26, 7},
+        {4, 16, 26, 16, 4},
+        {1,  4,  7,  4, 1}
+    };
+    int kernelWeight = 273;
+
+    #pragma omp parallel for schedule(dynamic)
+    for (int y = 2; y < height - 2; ++y) {
+        for (int x = 2; x < width - 2; ++x) {
+            int sum = 0;
+            for (int i = -2; i <= 2; ++i) {
+                for (int j = -2; j <= 2; ++j) {
+                    // Convert 2D coordinates to the 1D array index
+                    int pixelIndex = ((y + i) * width) + (x + j);
+                    sum += inputImage[pixelIndex] * kernel[i + 2][j + 2];
+                }
+            }
+            outputImage[(y * width) + x] = (unsigned char)(sum / kernelWeight);
+        }
+    }
+}
+
+//Sobel Filter
+void applyEdgeDetection(unsigned char* inputImage, unsigned char* outputEdges, float* outputAngles, int width, int height)
+{
+    cout << "Running Step 2: Edge Detection..." << endl;
+    
     int Gx[3][3] = { {-1, 0, 1}, {-2, 0, 2}, {-1, 0, 1} };
     int Gy[3][3] = { {-1, -2, -1}, {0, 0, 0}, {1, 2, 1} };
-
-    cout << "Starting OpenMP Edge Detection with " << omp_get_max_threads() << " threads..." << endl;
 
     //parallelize the outer loop
     #pragma omp parallel for schedule(dynamic)
@@ -26,7 +56,6 @@ void applyEdgeDetection(unsigned char* inputImage, unsigned char* outputEdges, i
 
             for (int i = -1; i <= 1; ++i) {
                 for (int j = -1; j <= 1; ++j) {
-                    // Convert 2D coordinates to 1D array
                     int pixelIndex = ((y + i) * width) + (x + j);
                     int pixelValue = inputImage[pixelIndex];
 
@@ -36,52 +65,135 @@ void applyEdgeDetection(unsigned char* inputImage, unsigned char* outputEdges, i
             }
 
             int magnitude = sqrt((sumX * sumX) + (sumY * sumY));
+            float angle = atan2(sumY, sumX) * (180.0 / 3.14159265);
+            if (angle < 0) {
+                angle += 180.0;
+            }
+            outputAngles[(y * width) + x] = angle;
             if (magnitude > 255) magnitude = 255;
-
-            // Store the result
             outputEdges[(y * width) + x] = (unsigned char)magnitude;
         }
     }
 }
 
-int main() 
+//Non-Maximum Suppression
+void applyNonMaxSuppression(unsigned char* magnitudeImg, float* angleImg, unsigned char* outputImg, int width, int height)
 {
+    cout << "Running Step 3: Non-Maximum Suppression..." << endl;
+    #pragma omp parallel for schedule(dynamic)
+    for (int y = 1; y < height - 1; ++y) {
+        for (int x = 1; x < width - 1; ++x) {
+            int idx = (y * width) + x;
+            float angle = angleImg[idx];
+            unsigned char mag = magnitudeImg[idx];
+            unsigned char pixel1 = 255;
+            unsigned char pixel2 = 255;
+
+            if ((angle >= 0 && angle < 22.5) || (angle >= 157.5 && angle <= 180)) {
+                pixel1 = magnitudeImg[y * width + (x + 1)];
+                pixel2 = magnitudeImg[y * width + (x - 1)];
+            }
+            else if (angle >= 22.5 && angle < 67.5) {
+                pixel1 = magnitudeImg[(y + 1) * width + (x - 1)];
+                pixel2 = magnitudeImg[(y - 1) * width + (x + 1)];
+            }
+            else if (angle >= 67.5 && angle < 112.5) {
+                pixel1 = magnitudeImg[(y + 1) * width + x];
+                pixel2 = magnitudeImg[(y - 1) * width + x];
+            }
+            else if (angle >= 112.5 && angle < 157.5) {
+                pixel1 = magnitudeImg[(y - 1) * width + (x - 1)];
+                pixel2 = magnitudeImg[(y + 1) * width + (x + 1)];
+            }
+
+            if (mag >= pixel1 && mag >= pixel2) {
+                outputImg[idx] = mag;
+            }
+            else {
+                outputImg[idx] = 0;
+            }
+        }
+    }
+}
+
+// Finalize edges using High and Low thresholds
+void applyHysteresis(unsigned char* inputImg, unsigned char* outputImg, int width, int height, int lowThresh, int highThresh) 
+{
+    cout << "Running Step 4: Hysteresis Thresholding..." << endl;
+    #pragma omp parallel for schedule(dynamic)
+    for (int i = 0; i < width * height; ++i) {
+        if (inputImg[i] >= highThresh) {
+            outputImg[i] = 255;
+        }
+        else if (inputImg[i] >= lowThresh) {
+            outputImg[i] = 50;
+        }
+        else {
+            outputImg[i] = 0;
+        }
+    }
+
+    #pragma omp parallel for schedule(dynamic)
+    for (int y = 1; y < height - 1; ++y) {
+        for (int x = 1; x < width - 1; ++x) {
+            int idx = (y * width) + x;
+
+            if (outputImg[idx] == 50) {
+                bool touchesStrongEdge = false;
+                for (int i = -1; i <= 1; ++i) {
+                    for (int j = -1; j <= 1; ++j) {
+                        int neighborIdx = ((y + i) * width) + (x + j);
+                        if (outputImg[neighborIdx] == 255) {
+                            touchesStrongEdge = true;
+                        }
+                    }
+                }
+
+                // If it touches a strong edge, it's a real edge. Otherwise, it's noise.
+                if (touchesStrongEdge) {
+                    outputImg[idx] = 255;
+                }
+                else {
+                    outputImg[idx] = 0;
+                }
+            }
+        }
+    }
+}
+
+int main() {
     int width, height, channels;
-    unsigned char* imgData = stbi_load("banana.jpg", &width, &height, &channels, 1);
-
-    if (imgData == NULL) {
-        cout << "Error loading banana.jpg." << endl;
-        return 1;
-    }
-    cout << "Loaded image: " << width << "x" << height << " pixels." << endl;
-
+    unsigned char* rawImg = stbi_load("road.jpg", &width, &height, &channels, 1);
     size_t imgSize = width * height;
-    unsigned char* outputData = new unsigned char[imgSize];
-    
-    // Initialize output array to pure black (0)
-    for (size_t i = 0; i < imgSize; ++i) {
-        outputData[i] = 0;
-    }
+    unsigned char* blurredImg = new unsigned char[imgSize];
+    float* angleImg = new float[imgSize];
+    unsigned char* sobelImg = new unsigned char[imgSize];
+    unsigned char* nmsImg = new unsigned char[imgSize];
+    unsigned char* finalImg = new unsigned char[imgSize];
 
-    omp_set_num_threads(4);
-    double startTime = omp_get_wtime();
-    applyEdgeDetection(imgData, outputData, width, height);
-    double endTime = omp_get_wtime();
-    cout << "Processing Time: " << (endTime - startTime) << " seconds." << endl;
+    //1: Gaussian Blur
+    applyGaussianBlur(rawImg, blurredImg, width, height);
+    stbi_write_jpg("1_blurred.jpg", width, height, 1, blurredImg, 100);
 
-    //Save result
-    int writeSuccess = stbi_write_jpg("output_edges.jpg", width, height, 1, outputData, 100);
+    //2: Sobel Filter
+    applyEdgeDetection(blurredImg, sobelImg, angleImg, width, height);
+    stbi_write_jpg("2_sobel_edges.jpg", width, height, 1, sobelImg, 100);
 
-    if (writeSuccess) {
-        cout << "Successfully saved edge detection result to 'output_edges.jpg'." << endl;
-    }
-    else {
-        cout << "Failed to write the output image." << endl;
-    }
+    //3: Non-Maximum Suppression
+    applyNonMaxSuppression(sobelImg, angleImg, nmsImg, width, height);
+    stbi_write_jpg("3_nms_thinned.jpg", width, height, 1, nmsImg, 100);
 
-    //Clean up memory
-    stbi_image_free(imgData);
-    delete[] outputData;
+    //4: Hysteresis Thresholding
+    applyHysteresis(nmsImg, finalImg, width, height, 50, 150);
+    stbi_write_jpg("4_final_edges.jpg", width, height, 1, finalImg, 100);
+
+    // Clean up memory
+    stbi_image_free(rawImg);
+    delete[] blurredImg;
+    delete[] sobelImg;
+    delete[] nmsImg;
+    delete[] finalImg;
+    delete[] angleImg;
 
     return 0;
 }
