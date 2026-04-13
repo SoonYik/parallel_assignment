@@ -117,18 +117,23 @@ void applyNonMaxSuppression(unsigned char* magnitudeImg, float* angleImg, unsign
 }
 
 // Finalize edges using High and Low thresholds
-void applyHysteresis(unsigned char* inputImg, unsigned char* outputImg, int width, int height, int lowThresh, int highThresh) 
+void applyHysteresis(unsigned char* inputImg, unsigned char* outputImg, int width, int height, int lowThresh, int highThresh)
 {
     cout << "Running Step 4: Hysteresis Thresholding..." << endl;
+
+    unsigned char* tempThresh = new unsigned char[width * height];
+
     #pragma omp parallel for schedule(dynamic)
     for (int i = 0; i < width * height; ++i) {
         if (inputImg[i] >= highThresh) {
+            tempThresh[i] = 255;
             outputImg[i] = 255;
         }
         else if (inputImg[i] >= lowThresh) {
-            outputImg[i] = 50;
+            tempThresh[i] = 50;
         }
         else {
+            tempThresh[i] = 0;
             outputImg[i] = 0;
         }
     }
@@ -137,19 +142,16 @@ void applyHysteresis(unsigned char* inputImg, unsigned char* outputImg, int widt
     for (int y = 1; y < height - 1; ++y) {
         for (int x = 1; x < width - 1; ++x) {
             int idx = (y * width) + x;
-
-            if (outputImg[idx] == 50) {
+            if (tempThresh[idx] == 50) {
                 bool touchesStrongEdge = false;
                 for (int i = -1; i <= 1; ++i) {
                     for (int j = -1; j <= 1; ++j) {
                         int neighborIdx = ((y + i) * width) + (x + j);
-                        if (outputImg[neighborIdx] == 255) {
+                        if (tempThresh[neighborIdx] == 255) {
                             touchesStrongEdge = true;
                         }
                     }
                 }
-
-                // If it touches a strong edge, it's a real edge. Otherwise, it's noise.
                 if (touchesStrongEdge) {
                     outputImg[idx] = 255;
                 }
@@ -159,6 +161,8 @@ void applyHysteresis(unsigned char* inputImg, unsigned char* outputImg, int widt
             }
         }
     }
+
+    delete[] tempThresh; // Clean up memory
 }
 
 int main() {
@@ -170,6 +174,8 @@ int main() {
     unsigned char* sobelImg = new unsigned char[imgSize];
     unsigned char* nmsImg = new unsigned char[imgSize];
     unsigned char* finalImg = new unsigned char[imgSize];
+
+    double startTime = omp_get_wtime();
 
     //1: Gaussian Blur
     applyGaussianBlur(rawImg, blurredImg, width, height);
@@ -186,6 +192,9 @@ int main() {
     //4: Hysteresis Thresholding
     applyHysteresis(nmsImg, finalImg, width, height, 50, 150);
     stbi_write_jpg("4_final_edges.jpg", width, height, 1, finalImg, 100);
+
+    double endTime = omp_get_wtime();
+    cout << "Total execution time: " << (endTime - startTime) << " seconds" << endl;
 
     // Clean up memory
     stbi_image_free(rawImg);
