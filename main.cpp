@@ -1,6 +1,7 @@
 #include <iostream>
 #include <cmath>
 #include <omp.h>
+#include <mpi.h>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -12,7 +13,7 @@ using namespace std;
 //Gaussian Blur
 void applyGaussianBlur(unsigned char* inputImage, unsigned char* outputImage, int width, int height) 
 {
-    cout << "Running Step 1: Gaussian Blur..." << endl;
+    //cout << "Running Step 1: Gaussian Blur..." << endl;
 
     int kernel[5][5] = {
         {1,  4,  7,  4, 1},
@@ -42,7 +43,7 @@ void applyGaussianBlur(unsigned char* inputImage, unsigned char* outputImage, in
 //Sobel Filter
 void applyEdgeDetection(unsigned char* inputImage, unsigned char* outputEdges, float* outputAngles, int width, int height)
 {
-    cout << "Running Step 2: Edge Detection..." << endl;
+    //cout << "Running Step 2: Edge Detection..." << endl;
     
     int Gx[3][3] = { {-1, 0, 1}, {-2, 0, 2}, {-1, 0, 1} };
     int Gy[3][3] = { {-1, -2, -1}, {0, 0, 0}, {1, 2, 1} };
@@ -79,7 +80,7 @@ void applyEdgeDetection(unsigned char* inputImage, unsigned char* outputEdges, f
 //Non-Maximum Suppression
 void applyNonMaxSuppression(unsigned char* magnitudeImg, float* angleImg, unsigned char* outputImg, int width, int height)
 {
-    cout << "Running Step 3: Non-Maximum Suppression..." << endl;
+    //cout << "Running Step 3: Non-Maximum Suppression..." << endl;
     #pragma omp parallel for schedule(dynamic)
     for (int y = 1; y < height - 1; ++y) {
         for (int x = 1; x < width - 1; ++x) {
@@ -119,7 +120,7 @@ void applyNonMaxSuppression(unsigned char* magnitudeImg, float* angleImg, unsign
 // Finalize edges using High and Low thresholds
 void applyHysteresis(unsigned char* inputImg, unsigned char* outputImg, int width, int height, int lowThresh, int highThresh)
 {
-    cout << "Running Step 4: Hysteresis Thresholding..." << endl;
+    //cout << "Running Step 4: Hysteresis Thresholding..." << endl;
 
     unsigned char* tempThresh = new unsigned char[width * height];
 
@@ -165,44 +166,123 @@ void applyHysteresis(unsigned char* inputImg, unsigned char* outputImg, int widt
     delete[] tempThresh; // Clean up memory
 }
 
-int main() {
-    int width, height, channels;
-    unsigned char* rawImg = stbi_load("road.jpg", &width, &height, &channels, 1);
-    size_t imgSize = width * height;
-    unsigned char* blurredImg = new unsigned char[imgSize];
-    float* angleImg = new float[imgSize];
-    unsigned char* sobelImg = new unsigned char[imgSize];
-    unsigned char* nmsImg = new unsigned char[imgSize];
-    unsigned char* finalImg = new unsigned char[imgSize];
+void runHybridProcessing(unsigned char* fullVideoBuffer, int width, int height, int totalFrames, int rank, int size) {
+
+    int frames_per_rank = totalFrames / size;
+    size_t frame_size = (size_t)width * height;
+    size_t batch_size = frame_size * frames_per_rank;
+
+    // Buffer to hold the frames assigned to this rank
+    unsigned char* localBatchInput = new unsigned char[batch_size];
+    unsigned char* localBatchOutput = new unsigned char[batch_size];
+
+    // 1. Distribute the frames
+    MPI_Scatter(fullVideoBuffer, batch_size, MPI_UNSIGNED_CHAR,
+        localBatchInput, batch_size, MPI_UNSIGNED_CHAR, 0, MPI_COMM_WORLD);
+
+    // 2. The Worker Loop: Process each frame in the batch
+    for (int f = 0; f < frames_per_rank; ++f)
+    {
+        unsigned char* currentFrameIn = &localBatchInput[f * frame_size];
+        unsigned char* currentFrameOut = &localBatchOutput[f * frame_size];
+
+        // Temporary buffers for OpenMP pipeline
+        unsigned char* tempBlur = new unsigned char[frame_size];
+        unsigned char* tempSobel = new unsigned char[frame_size];
+        unsigned char* tempNms = new unsigned char[frame_size];
+        float* tempAngles = new float[frame_size];
+
+        // Call the pipeline
+        applyGaussianBlur(currentFrameIn, tempBlur, width, height);
+        applyEdgeDetection(tempBlur, tempSobel, tempAngles, width, height);
+        applyNonMaxSuppression(tempSobel, tempAngles, currentFrameOut/*tempNms*/, width, height);
+        //applyHysteresis(tempNms, currentFrameOut, width, height, 50, 150);
+
+        delete[] tempBlur; delete[] tempSobel; delete[] tempAngles; delete[] tempNms;
+    }
+
+    // 3. Gather the processed frames
+    MPI_Gather(localBatchOutput, batch_size, MPI_UNSIGNED_CHAR,
+        fullVideoBuffer, batch_size, MPI_UNSIGNED_CHAR, 0, MPI_COMM_WORLD);
+
+    delete[] localBatchInput;
+    delete[] localBatchOutput;
+}
+
+int main(int argc, char** argv) 
+{
+    MPI_Init(&argc, &argv);
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    int totalFrames = 0;
+    int width = 0, height = 0, channels = 0;
+    unsigned char* videoBuffer = NULL;
+
+    if (rank == 0)
+    {
+        while (true)
+        {
+            char filename[64];
+            sprintf(filename, "frames/%05d.jpg", totalFrames + 1);
+            if (stbi_info(filename, &width, &height, &channels))
+            {
+                totalFrames++;
+            }
+            else {
+                break;
+            }
+        }
+
+        if (totalFrames == 0)
+        {
+            cout << "Error: No frames found!" << endl;
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+
+        totalFrames = (totalFrames / size) * size;
+
+        cout << "Detected " << totalFrames << " frames. Resolution: " << width << "x" << height << endl;
+
+        size_t totalSize = (size_t)width * height * totalFrames;
+        videoBuffer = new unsigned char[totalSize];
+
+        for (int i = 0; i < totalFrames; i++)
+        {
+            char filename[64];
+            sprintf(filename, "frames/%05d.jpg", i + 1);
+            int w, h, c;
+            unsigned char* data = stbi_load(filename, &w, &h, &c, 1);
+            memcpy(videoBuffer + ((size_t)i * width * height), data, (size_t)width * height);
+            stbi_image_free(data);
+        }
+    }
+
+    // 4. Share dimensions so all workers can prepare their local memory
+    MPI_Bcast(&totalFrames, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&width, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&height, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
     double startTime = omp_get_wtime();
 
-    //1: Gaussian Blur
-    applyGaussianBlur(rawImg, blurredImg, width, height);
-    stbi_write_jpg("1_blurred.jpg", width, height, 1, blurredImg, 100);
+    // 5. Run the processing
+    runHybridProcessing(videoBuffer, width, height, totalFrames, rank, size);
 
-    //2: Sobel Filter
-    applyEdgeDetection(blurredImg, sobelImg, angleImg, width, height);
-    stbi_write_jpg("2_sobel_edges.jpg", width, height, 1, sobelImg, 100);
+    if (rank == 0) {
+        double endTime = omp_get_wtime();
+        cout << "Total Parallel Execution time: " << (endTime - startTime) << " seconds" << endl;
+        cout << "Total Parallel Execution time per frame: " << (endTime - startTime)/ totalFrames << " seconds" << endl;
+        // 6. Save results
+        for (int i = 0; i < totalFrames; i++) {
+            char outName[64];
+            sprintf(outName, "output/processed_%05d.jpg", i + 1);
+            stbi_write_jpg(outName, width, height, 1, videoBuffer + ((size_t)i * width * height), 100);
+        }
 
-    //3: Non-Maximum Suppression
-    applyNonMaxSuppression(sobelImg, angleImg, nmsImg, width, height);
-    stbi_write_jpg("3_nms_thinned.jpg", width, height, 1, nmsImg, 100);
+        delete[] videoBuffer;
+    }
 
-    //4: Hysteresis Thresholding
-    applyHysteresis(nmsImg, finalImg, width, height, 50, 150);
-    stbi_write_jpg("4_final_edges.jpg", width, height, 1, finalImg, 100);
-
-    double endTime = omp_get_wtime();
-    cout << "Total execution time: " << (endTime - startTime) << " seconds" << endl;
-
-    // Clean up memory
-    stbi_image_free(rawImg);
-    delete[] blurredImg;
-    delete[] sobelImg;
-    delete[] nmsImg;
-    delete[] finalImg;
-    delete[] angleImg;
-
+    MPI_Finalize();
     return 0;
 }

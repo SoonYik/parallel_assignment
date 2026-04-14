@@ -1,0 +1,13 @@
+# Ignore media files
+frames/
+output/
+*.mp4
+
+# Ignore Visual Studio build folders
+x64/
+.vs/
+Debug/
+Release/
+
+# Ignore your backup folder if you put it inside this repo
+*Backup_Phase1/
