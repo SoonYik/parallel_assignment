@@ -166,115 +166,126 @@ void applyHysteresis(unsigned char* inputImg, unsigned char* outputImg, int widt
     delete[] tempThresh; // Clean up memory
 }
 
-void runHybridProcessing(unsigned char* fullImage, int width, int height, int rank, int size) {
+//run MPI hybrid processing
+void runHybridProcessing(unsigned char* fullVideoBuffer, int width, int height, int totalFrames, int rank, int size) {
 
-    int rows_per_rank = height / size;
-    int chunk_size = width * rows_per_rank;
+    int frames_per_rank = totalFrames / size;
+    size_t frame_size = (size_t)width * height;
+    size_t batch_size = frame_size * frames_per_rank;
 
-    unsigned char* localInput = new unsigned char[chunk_size];
-    unsigned char* localBlur = new unsigned char[chunk_size];
-    unsigned char* localSobel = new unsigned char[chunk_size];
-    float* localAngles = new float[chunk_size];
-    unsigned char* localNms = new unsigned char[chunk_size];
-    unsigned char* localOutput = new unsigned char[chunk_size];
+    // Buffer to hold the frames assigned to this rank
+    unsigned char* localBatchInput = new unsigned char[batch_size];
+    unsigned char* localBatchOutput = new unsigned char[batch_size];
 
-    MPI_Scatter(fullImage, chunk_size, MPI_UNSIGNED_CHAR,
-        localInput, chunk_size, MPI_UNSIGNED_CHAR,
-        0, MPI_COMM_WORLD);
+    // 1. Distribute the frames
+    MPI_Scatter(fullVideoBuffer, batch_size, MPI_UNSIGNED_CHAR,
+        localBatchInput, batch_size, MPI_UNSIGNED_CHAR, 0, MPI_COMM_WORLD);
 
-    // 4. THE HAND-OFF: Call Soon Yik's code on the local chunk
-    // Notice we pass 'rows_per_rank' as the height!
-    applyGaussianBlur(localInput, localBlur, width, rows_per_rank);
-    applyEdgeDetection(localBlur, localSobel, localAngles, width, rows_per_rank);
-    applyNonMaxSuppression(localSobel, localAngles, localNms, width, rows_per_rank);
-    applyHysteresis(localNms, localOutput, width, rows_per_rank, 50, 150);
+    // 2. The Worker Loop: Process each frame in the batch
+    for (int f = 0; f < frames_per_rank; ++f) 
+    {
+        unsigned char* currentFrameIn = &localBatchInput[f * frame_size];
+        unsigned char* currentFrameOut = &localBatchOutput[f * frame_size];
 
-    // 5. GATHER: Rank 0 collects all the finished slices back into fullImage
-    MPI_Gather(localOutput, chunk_size, MPI_UNSIGNED_CHAR,
-        fullImage, chunk_size, MPI_UNSIGNED_CHAR,
-        0, MPI_COMM_WORLD);
+        // Temporary buffers for OpenMP pipeline
+        unsigned char* tempBlur = new unsigned char[frame_size];
+        unsigned char* tempSobel = new unsigned char[frame_size];
+        unsigned char* tempNms = new unsigned char[frame_size];
+        float* tempAngles = new float[frame_size];
 
-    // Clean up local memory
-    delete[] localInput; delete[] localBlur; delete[] localSobel;
-    delete[] localAngles; delete[] localNms; delete[] localOutput;
+        // Call the pipeline
+        applyGaussianBlur(currentFrameIn, tempBlur, width, height);
+        applyEdgeDetection(tempBlur, tempSobel, tempAngles, width, height);
+        applyNonMaxSuppression(tempSobel, tempAngles, tempNms, width, height);
+        applyHysteresis(tempNms, currentFrameOut, width, height, 50, 150);
+
+        delete[] tempBlur; delete[] tempSobel; delete[] tempAngles; delete[] tempNms;
+    }
+
+    // 3. Gather the processed frames
+    MPI_Gather(localBatchOutput, batch_size, MPI_UNSIGNED_CHAR,
+        fullVideoBuffer, batch_size, MPI_UNSIGNED_CHAR, 0, MPI_COMM_WORLD);
+
+    delete[] localBatchInput; 
+    delete[] localBatchOutput;
 }
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv) 
+{
     MPI_Init(&argc, &argv);
     int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-    int width, height, channels;
-    unsigned char* rawImg = NULL;
+    int totalFrames = 0;
+    int width = 0, height = 0, channels = 0;
+    unsigned char* videoBuffer = NULL;
 
-    // Only Rank 0 loads the image
-    if (rank == 0) {
-        rawImg = stbi_load("road.jpg", &width, &height, &channels, 1);
-        if (!rawImg) {
-            cout << "Failed to load image!" << endl;
+    if (rank == 0) 
+    {
+        while (true)
+        {
+            char filename[64];
+            sprintf(filename, "frames/frame_%03d.jpg", totalFrames + 1);
+            if (stbi_info(filename, &width, &height, &channels))
+            {
+                totalFrames++;
+            }
+            else {
+                break;
+            }
+        }
+
+        if (totalFrames == 0) 
+        {
+            cout << "Error: No frames found!" << endl;
             MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+
+        totalFrames = (totalFrames / size) * size;
+
+        cout << "Detected " << totalFrames << " frames. Resolution: " << width << "x" << height << endl;
+
+        size_t totalSize = (size_t)width * height * totalFrames;
+        videoBuffer = new unsigned char[totalSize];
+
+        for (int i = 0; i < totalFrames; i++) 
+        {
+            char filename[64];
+            sprintf(filename, "frames/frame_%03d.jpg", i + 1);
+            int w, h, c;
+            unsigned char* data = stbi_load(filename, &w, &h, &c, 1);
+            memcpy(videoBuffer + ((size_t)i * width * height), data, (size_t)width * height);
+            stbi_image_free(data);
         }
     }
 
-    // Share dimensions with all ranks
+    // 4. Share dimensions so all workers can prepare their local memory
+    MPI_Bcast(&totalFrames, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(&width, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(&height, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
     double startTime = omp_get_wtime();
 
-    // Run your hybrid orchestration
-    runHybridProcessing(rawImg, width, height, rank, size);
+    // 5. Run the processing
+    runHybridProcessing(videoBuffer, width, height, totalFrames, rank, size);
 
     if (rank == 0) {
         double endTime = omp_get_wtime();
         cout << "Total Parallel Execution time: " << (endTime - startTime) << " seconds" << endl;
-        stbi_write_jpg("4_final_edges.jpg", width, height, 1, rawImg, 100);
-        stbi_image_free(rawImg);
+
+        // 6. Save results
+        for (int i = 0; i < totalFrames; i++) {
+            char outName[64];
+            sprintf(outName, "output/processed_%03d.jpg", i + 1);
+            stbi_write_jpg(outName, width, height, 1, videoBuffer + ((size_t)i * width * height), 100);
+        }
+
+        delete[] videoBuffer;
     }
 
     MPI_Finalize();
     return 0;
 }
 
-//int main() {
-//    int width, height, channels;
-//    unsigned char* rawImg = stbi_load("road.jpg", &width, &height, &channels, 1);
-//    size_t imgSize = width * height;
-//    unsigned char* blurredImg = new unsigned char[imgSize];
-//    float* angleImg = new float[imgSize];
-//    unsigned char* sobelImg = new unsigned char[imgSize];
-//    unsigned char* nmsImg = new unsigned char[imgSize];
-//    unsigned char* finalImg = new unsigned char[imgSize];
-//
-//    double startTime = omp_get_wtime();
-//
-//    //1: Gaussian Blur
-//    applyGaussianBlur(rawImg, blurredImg, width, height);
-//    stbi_write_jpg("1_blurred.jpg", width, height, 1, blurredImg, 100);
-//
-//    //2: Sobel Filter
-//    applyEdgeDetection(blurredImg, sobelImg, angleImg, width, height);
-//    stbi_write_jpg("2_sobel_edges.jpg", width, height, 1, sobelImg, 100);
-//
-//    //3: Non-Maximum Suppression
-//    applyNonMaxSuppression(sobelImg, angleImg, nmsImg, width, height);
-//    stbi_write_jpg("3_nms_thinned.jpg", width, height, 1, nmsImg, 100);
-//
-//    //4: Hysteresis Thresholding
-//    applyHysteresis(nmsImg, finalImg, width, height, 50, 150);
-//    stbi_write_jpg("4_final_edges.jpg", width, height, 1, finalImg, 100);
-//
-//    double endTime = omp_get_wtime();
-//    cout << "Total execution time: " << (endTime - startTime) << " seconds" << endl;
-//
-//    // Clean up memory
-//    stbi_image_free(rawImg);
-//    delete[] blurredImg;
-//    delete[] sobelImg;
-//    delete[] nmsImg;
-//    delete[] finalImg;
-//    delete[] angleImg;
-//
-//    return 0;
-//}
+
