@@ -2,6 +2,7 @@
 #include <cmath>
 #include <omp.h>
 #include <mpi.h>
+#include <direct.h>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -9,6 +10,8 @@
 #include "stb_image_write.h"
 
 using namespace std;
+
+extern "C" void launch_gaussian_blur(unsigned char* h_input, unsigned char* h_output, int w, int h);
 
 //Gaussian Blur
 void applyGaussianBlur(unsigned char* inputImage, unsigned char* outputImage, int width, int height) 
@@ -193,7 +196,8 @@ void runHybridProcessing(unsigned char* fullVideoBuffer, int width, int height, 
         float* tempAngles = new float[frame_size];
 
         // Call the pipeline
-        applyGaussianBlur(currentFrameIn, tempBlur, width, height);
+        //applyGaussianBlur(currentFrameIn, tempBlur, width, height);
+        launch_gaussian_blur(currentFrameIn, tempBlur, width, height); //CUDA
         applyEdgeDetection(tempBlur, tempSobel, tempAngles, width, height);
         applyNonMaxSuppression(tempSobel, tempAngles, currentFrameOut/*tempNms*/, width, height);
         //applyHysteresis(tempNms, currentFrameOut, width, height, 50, 150);
@@ -216,9 +220,12 @@ int main(int argc, char** argv)
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
+    char buff[FILENAME_MAX];
+
     int totalFrames = 0;
     int width = 0, height = 0, channels = 0;
     unsigned char* videoBuffer = NULL;
+
 
     if (rank == 0)
     {
@@ -237,6 +244,8 @@ int main(int argc, char** argv)
 
         if (totalFrames == 0)
         {
+            _getcwd(buff, FILENAME_MAX);
+            printf("Current working directory: %s\n", buff);
             cout << "Error: No frames found!" << endl;
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
