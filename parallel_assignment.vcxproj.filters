@@ -15,11 +15,6 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="main.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-  </ItemGroup>
-  <ItemGroup>
     <ClInclude Include="..\..\..\Downloads\stb source code\stb-master\stb_image.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -31,5 +26,13 @@
     <None Include="1.gitignore">
       <Filter>Source Files</Filter>
     </None>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="main.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <CudaCompile Include="SharedMemoryOpti.cu" />
   </ItemGroup>
 </Project>
